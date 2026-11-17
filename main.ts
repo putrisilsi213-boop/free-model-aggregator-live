@@ -10,9 +10,10 @@
 //     until one answers 2xx. Every refusal is reported in the
 //     `x-makefun-upstream-failures` header, so the failover column can see a refusal the
 //     server recovered from. At most 8 attempts per prompt.
-//   - rate limits: a model that refused once is cooled down for the rest of the trial:
-//     later prompts rank it last, so one rate-limited model cannot take every later
-//     prompt down with it. It is still tried when nothing else meets the requirements.
+//   - rate limits: a model that refuses is cooled down for the next prompt only:
+//     a 429 or 5xx is often a one-off blip, and a failed re-probe costs nothing on
+//     the tie-break, so the best model is re-tested one prompt later instead of being
+//     written off for the whole trial. Within one prompt it is never retried.
 //   - served (15%): the same failover keeps a request alive when its first model is out
 //     of budget or on its failure schedule; a prompt is only given up when every
 //     candidate has refused it.
@@ -83,8 +84,15 @@ const brief = readBrief(PROMPT_FILE);
 const catalog: CatalogReport = buildCatalog(brief);
 /** Which prompt row the request now arriving is: the brief's prompts are in the client's arrival order. */
 let manifestIndex = 0;
-/** The gateway ids of models that have refused a call this trial, in refusal order. */
-const cooledDown: string[] = [];
+/**
+ * The request number (1-based, as manifestIndex counts it) at which a refused model may
+ * be tried again. A refusal cools a model for the next prompt only: a 429 or 5xx is often
+ * a one-off blip, and a failed re-probe costs nothing on the tie-break (only calls the
+ * provider answers are counted), so the trial re-tests the best model one prompt later
+ * instead of writing it off for the whole trial. Within one prompt's failover loop the
+ * model is never retried: the candidate list is fixed when the prompt arrives.
+ */
+const coolUntil = new Map<string, number>();
 
 /** One refused gateway call, as the failover trail reports it. */
 interface UpstreamFailure {
@@ -112,20 +120,22 @@ function servedModels(): ServedModel[] {
 }
 
 /**
- * Every free model that can serve one request, best rating first. A model that has refused
- * a call this trial sinks to the end, in the order it refused; among the rest the brief's
- * order breaks rating ties (Array.sort is stable), so the ranking is deterministic.
+ * Every free model that can serve one request, best rating first. A model cooling down
+ * after a refusal is left out — unless every candidate is cooling down, in which case
+ * the list is tried as it stands. Ties keep the brief's order (Array.sort is stable),
+ * so the ranking is a pure function of the brief and the refusals seen so far.
  */
 function candidatesFor(requires: Requirement): ModelRow[] {
   const candidates = freeModels(brief).filter((model) => meetsRequirements(requires, capabilitiesOf(model)));
-  candidates.sort((a, b) => {
-    const aCool = cooledDown.indexOf(a.id);
-    const bCool = cooledDown.indexOf(b.id);
-    if ((aCool === -1) !== (bCool === -1)) return aCool === -1 ? -1 : 1;
-    if (aCool !== -1 && bCool !== -1 && aCool !== bCool) return aCool - bCool;
-    return b.rating_milli - a.rating_milli;
-  });
-  return candidates;
+  const fresh = candidates.filter((model) => (coolUntil.get(model.id) ?? 0) <= manifestIndex);
+  const pool = fresh.length > 0 ? fresh : candidates;
+  pool.sort((a, b) => b.rating_milli - a.rating_milli);
+  return pool;
+}
+
+/** Cool a refused model down until the prompt after next may try it again. */
+function coolDown(modelId: string): void {
+  coolUntil.set(modelId, manifestIndex + 2);
 }
 
 /** The requirements of the prompt now arriving: the brief's row by arrival order, else the body's own. */
@@ -259,13 +269,13 @@ async function dialFirst(
     } catch (err) {
       const timeout = err instanceof Error && err.name === 'TimeoutError';
       failures.push({ status: timeout ? 504 : 502, code: timeout ? 'upstream_timeout' : 'upstream_unreachable', model: candidate.id });
-      if (!cooledDown.includes(candidate.id)) cooledDown.push(candidate.id);
+      coolDown(candidate.id);
       continue;
     }
     if (upstream.ok && upstream.body !== null) return { model: candidate.id, upstream, failures };
     const text = await upstream.text();
     failures.push({ status: upstream.status, code: failureCode(upstream.status, text), model: candidate.id });
-    if (!cooledDown.includes(candidate.id)) cooledDown.push(candidate.id);
+    coolDown(candidate.id);
     log(`gateway refused ${candidate.id} with HTTP ${upstream.status}`);
   }
   return { model: null, upstream: null, failures };
